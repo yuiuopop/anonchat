@@ -32,8 +32,14 @@ ADMIN_ID_RAW = os.getenv("ADMIN_ID", "").strip()
 ADMIN_ID = int(ADMIN_ID_RAW) if ADMIN_ID_RAW.isdigit() else None
 COMMAND_COOLDOWN_SECONDS = float(os.getenv("COMMAND_COOLDOWN_SECONDS", "3"))
 
-KEYBOARD = ReplyKeyboardMarkup(
-    [["Find Stranger", "Next"], ["Stop", "Report"]],
+USER_KEYBOARD = ReplyKeyboardMarkup(
+    [["🔎 Find Stranger", "⏭️ Next"], ["🛑 Stop", "🚩 Report"]],
+    resize_keyboard=True,
+)
+
+ADMIN_DASHBOARD_BUTTON = "📊 Admin Dashboard"
+ADMIN_KEYBOARD = ReplyKeyboardMarkup(
+    [["🔎 Find Stranger", "⏭️ Next"], ["🛑 Stop", "🚩 Report"], [ADMIN_DASHBOARD_BUTTON]],
     resize_keyboard=True,
 )
 
@@ -167,7 +173,8 @@ def on_cooldown(user_id: int, action: str) -> tuple[bool, float]:
 
 async def safe_send(application: Application, user_id: int, text: str, *, with_keyboard: bool = True) -> None:
     try:
-        kwargs = {"reply_markup": KEYBOARD} if with_keyboard else {}
+        keyboard = ADMIN_KEYBOARD if ADMIN_ID is not None and user_id == ADMIN_ID else USER_KEYBOARD
+        kwargs = {"reply_markup": keyboard} if with_keyboard else {}
         await application.bot.send_message(chat_id=user_id, text=text, **kwargs)
     except TelegramError:
         logging.warning("Failed to send message to %s", user_id)
@@ -208,7 +215,14 @@ async def start_find_flow(application: Application, user_id: int) -> None:
 async def start_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     user_id = update.effective_user.id
     ensure_user(user_id)
-    await safe_send(context.application, user_id, "Welcome. Use /find to chat anonymously.")
+    if ADMIN_ID is not None and user_id == ADMIN_ID:
+        await safe_send(
+            context.application,
+            user_id,
+            "✅ Admin access granted\nUse 📊 Admin Dashboard to view live bot stats.",
+        )
+        return
+    await safe_send(context.application, user_id, "👋 Welcome. Use /find to chat anonymously.")
 
 
 async def find_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -363,11 +377,11 @@ async def admin_stats_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         context.application,
         user_id,
         (
-            "Admin stats\n"
-            f"Total users: {total}\n"
-            f"Chatting users: {chatting}\n"
-            f"Searching users: {searching}\n"
-            f"Banned users: {banned}"
+            "📊 Admin Dashboard\n"
+            f"👥 Total users: {total}\n"
+            f"💬 Chatting users: {chatting}\n"
+            f"🔎 Searching users: {searching}\n"
+            f"⛔ Banned users: {banned}"
         ),
     )
 
@@ -381,17 +395,20 @@ async def text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     if not text:
         return
 
-    if text == "Find Stranger":
+    if text == "🔎 Find Stranger" or text == "Find Stranger":
         await start_find_flow(context.application, user_id)
         return
-    if text == "Next":
+    if text == "⏭️ Next" or text == "Next":
         await next_cmd(update, context)
         return
-    if text == "Stop":
+    if text == "🛑 Stop" or text == "Stop":
         await stop_cmd(update, context)
         return
-    if text == "Report":
+    if text == "🚩 Report" or text == "Report":
         await report_cmd(update, context)
+        return
+    if text == ADMIN_DASHBOARD_BUTTON:
+        await admin_stats_cmd(update, context)
         return
 
     partner_id = None

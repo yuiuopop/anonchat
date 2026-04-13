@@ -40,7 +40,7 @@ BTN_REPORT = "🚩 Report"
 BTN_ADMIN_PANEL = "🛠️ Admin Panel"
 BTN_SET_START = "✏️ Set Start Message"
 BTN_TOGGLE_FIREWALL = "🧱 Toggle Firewall"
-BTN_SET_GROUP = "🎯 Set Firewall Group"
+BTN_SET_GROUP_LINK = "🔗 Link"
 BTN_SET_FW_MSG = "💬 Set Firewall Message"
 BTN_ADMIN_CANCEL = "❌ Cancel Admin Edit"
 BTN_SEX_MALE = "♂️ Male"
@@ -50,11 +50,11 @@ USER_KEYBOARD = ReplyKeyboardMarkup([[BTN_FIND, BTN_NEXT], [BTN_STOP, BTN_REPORT
 SEXUALITY_KEYBOARD = ReplyKeyboardMarkup([[BTN_SEX_MALE, BTN_SEX_FEMALE]], resize_keyboard=True)
 ADMIN_KEYBOARD = ReplyKeyboardMarkup(
     [
-        [BTN_FIND, BTN_NEXT],
-        [BTN_STOP, BTN_REPORT],
         [BTN_ADMIN_PANEL],
         [BTN_SET_START, BTN_TOGGLE_FIREWALL],
-        [BTN_SET_GROUP, BTN_SET_FW_MSG],
+        [BTN_SET_GROUP_LINK, BTN_SET_FW_MSG],
+        [BTN_FIND, BTN_NEXT],
+        [BTN_STOP, BTN_REPORT],
         [BTN_ADMIN_CANCEL],
     ],
     resize_keyboard=True,
@@ -610,7 +610,7 @@ async def handle_admin_pending_text(
         BTN_ADMIN_PANEL,
         BTN_SET_START,
         BTN_TOGGLE_FIREWALL,
-        BTN_SET_GROUP,
+        BTN_SET_GROUP_LINK,
         BTN_SET_FW_MSG,
     }:
         return False
@@ -702,12 +702,12 @@ async def text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
             set_setting(SETTING_FIREWALL_ENABLED, "0" if enabled else "1")
             await safe_send(context.application, user_id, f"✅ Firewall is now {'OFF' if enabled else 'ON'}.")
             return
-        if text == BTN_SET_GROUP:
+        if text == BTN_SET_GROUP_LINK:
             admin_pending_action = "set_firewall_group"
             await safe_send(
                 context.application,
                 user_id,
-                "Send firewall group ID or username now (example: -1001234567890 or @mygroup).",
+                "Send firewall group link now (example: https://t.me/yourgroup or t.me/yourgroup).",
             )
             return
         if text == BTN_SET_FW_MSG:

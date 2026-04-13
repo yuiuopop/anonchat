@@ -13,6 +13,7 @@ from telegram.constants import ChatAction
 from telegram.error import TelegramError
 from telegram.ext import (
     Application,
+    ChatJoinRequestHandler,
     CommandHandler,
     ContextTypes,
     MessageHandler,
@@ -27,30 +28,52 @@ if not BOT_TOKEN:
 DB_PATH = os.getenv("DB_PATH", "anon_chat.db")
 REPORT_BAN_THRESHOLD = int(os.getenv("REPORT_BAN_THRESHOLD", "3"))
 MAX_WARNINGS = int(os.getenv("MAX_WARNINGS", "3"))
+COMMAND_COOLDOWN_SECONDS = float(os.getenv("COMMAND_COOLDOWN_SECONDS", "3"))
 BAD_WORDS = [w.strip().lower() for w in os.getenv("BAD_WORDS", "abuse,slur,badword").split(",") if w.strip()]
 ADMIN_ID_RAW = os.getenv("ADMIN_ID", "").strip()
 ADMIN_ID = int(ADMIN_ID_RAW) if ADMIN_ID_RAW.isdigit() else None
-COMMAND_COOLDOWN_SECONDS = float(os.getenv("COMMAND_COOLDOWN_SECONDS", "3"))
 
-USER_KEYBOARD = ReplyKeyboardMarkup(
-    [["🔎 Find Stranger", "⏭️ Next"], ["🛑 Stop", "🚩 Report"]],
-    resize_keyboard=True,
-)
+BTN_FIND = "🔎 Find Stranger"
+BTN_NEXT = "⏭️ Next"
+BTN_STOP = "🛑 Stop"
+BTN_REPORT = "🚩 Report"
+BTN_ADMIN_PANEL = "🛠️ Admin Panel"
+BTN_SET_START = "✏️ Set Start Message"
+BTN_TOGGLE_FIREWALL = "🧱 Toggle Firewall"
+BTN_SET_GROUP = "🎯 Set Firewall Group"
+BTN_SET_FW_MSG = "💬 Set Firewall Message"
+BTN_ADMIN_CANCEL = "❌ Cancel Admin Edit"
+BTN_SEX_MALE = "♂️ Male"
+BTN_SEX_FEMALE = "♀️ Female"
 
-ADMIN_DASHBOARD_BUTTON = "📊 Admin Dashboard"
+USER_KEYBOARD = ReplyKeyboardMarkup([[BTN_FIND, BTN_NEXT], [BTN_STOP, BTN_REPORT]], resize_keyboard=True)
+SEXUALITY_KEYBOARD = ReplyKeyboardMarkup([[BTN_SEX_MALE, BTN_SEX_FEMALE]], resize_keyboard=True)
 ADMIN_KEYBOARD = ReplyKeyboardMarkup(
-    [["🔎 Find Stranger", "⏭️ Next"], ["🛑 Stop", "🚩 Report"], [ADMIN_DASHBOARD_BUTTON]],
+    [
+        [BTN_FIND, BTN_NEXT],
+        [BTN_STOP, BTN_REPORT],
+        [BTN_ADMIN_PANEL],
+        [BTN_SET_START, BTN_TOGGLE_FIREWALL],
+        [BTN_SET_GROUP, BTN_SET_FW_MSG],
+        [BTN_ADMIN_CANCEL],
+    ],
     resize_keyboard=True,
 )
 
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s | %(levelname)s | %(message)s",
-)
+SETTING_START_MESSAGE = "start_message"
+SETTING_FIREWALL_ENABLED = "firewall_enabled"
+SETTING_FIREWALL_GROUP = "firewall_group"
+SETTING_FIREWALL_MESSAGE = "firewall_message"
+
+DEFAULT_START_MESSAGE = "👋 Welcome to Anonymous Chat Bot.\nUse /find to connect with a stranger."
+DEFAULT_FIREWALL_MESSAGE = "🧱 Access locked. Join {group} and try again."
+
+logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(levelname)s | %(message)s")
 
 state_lock = asyncio.Lock()
 db_lock = Lock()
 _db_conn: Optional[sqlite3.Connection] = None
+admin_pending_action: Optional[str] = None
 user_cooldowns: dict[tuple[int, str], float] = {}
 
 
@@ -98,6 +121,7 @@ def init_db() -> None:
             status TEXT NOT NULL DEFAULT 'idle',
             partner_id INTEGER NULL,
             waiting_since INTEGER NULL,
+            sexuality TEXT NULL,
             reports_received INTEGER NOT NULL DEFAULT 0,
             reports_sent INTEGER NOT NULL DEFAULT 0,
             warnings INTEGER NOT NULL DEFAULT 0,
@@ -107,16 +131,63 @@ def init_db() -> None:
         )
         """
     )
+    db_execute(
+        """
+        CREATE TABLE IF NOT EXISTS bot_settings (
+            key TEXT PRIMARY KEY,
+            value TEXT NOT NULL
+        )
+        """
+    )
+    db_execute(
+        """
+        CREATE TABLE IF NOT EXISTS join_requests (
+            user_id INTEGER NOT NULL,
+            group_id TEXT NOT NULL,
+            requested_at INTEGER NOT NULL,
+            status TEXT NOT NULL DEFAULT 'pending',
+            PRIMARY KEY (user_id, group_id)
+        )
+        """
+    )
+
     columns = db_execute("PRAGMA table_info(users)", fetchall=True) or []
     column_names = {row["name"] for row in columns}
     if "waiting_since" not in column_names:
         db_execute("ALTER TABLE users ADD COLUMN waiting_since INTEGER NULL")
+    if "sexuality" not in column_names:
+        db_execute("ALTER TABLE users ADD COLUMN sexuality TEXT NULL")
+
+    set_setting_if_missing(SETTING_START_MESSAGE, DEFAULT_START_MESSAGE)
+    set_setting_if_missing(SETTING_FIREWALL_ENABLED, "0")
+    set_setting_if_missing(SETTING_FIREWALL_GROUP, "")
+    set_setting_if_missing(SETTING_FIREWALL_MESSAGE, DEFAULT_FIREWALL_MESSAGE)
+
+
+def set_setting_if_missing(key: str, value: str) -> None:
+    db_execute("INSERT OR IGNORE INTO bot_settings (key, value) VALUES (?, ?)", (key, value))
+
+
+def get_setting(key: str, default: str = "") -> str:
+    row = db_execute("SELECT value FROM bot_settings WHERE key = ?", (key,), fetchone=True)
+    if not row:
+        return default
+    return str(row["value"])
+
+
+def set_setting(key: str, value: str) -> None:
+    db_execute(
+        """
+        INSERT INTO bot_settings (key, value) VALUES (?, ?)
+        ON CONFLICT(key) DO UPDATE SET value = excluded.value
+        """,
+        (key, value),
+    )
 
 
 def ensure_user(user_id: int) -> sqlite3.Row:
     db_execute("INSERT OR IGNORE INTO users (user_id) VALUES (?)", (user_id,))
-    row = db_execute("SELECT * FROM users WHERE user_id = ?", (user_id,), fetchone=True)
-    return row
+    return db_execute("SELECT * FROM users WHERE user_id = ?", (user_id,), fetchone=True)
 
 
 def get_user(user_id: int) -> Optional[sqlite3.Row]:
@@ -164,17 +235,36 @@ def on_cooldown(user_id: int, action: str) -> tuple[bool, float]:
     now = time.monotonic()
     key = (user_id, action)
     last = user_cooldowns.get(key, 0.0)
-    delta = now - last
-    if delta < COMMAND_COOLDOWN_SECONDS:
-        return True, COMMAND_COOLDOWN_SECONDS - delta
+    if now - last < COMMAND_COOLDOWN_SECONDS:
+        return True, COMMAND_COOLDOWN_SECONDS - (now - last)
     user_cooldowns[key] = now
     return False, 0.0
 
 
-async def safe_send(application: Application, user_id: int, text: str, *, with_keyboard: bool = True) -> None:
+def is_admin(user_id: int) -> bool:
+    return ADMIN_ID is not None and user_id == ADMIN_ID
+
+
+def keyboard_for_user(user_id: int, require_sexuality: bool = False) -> ReplyKeyboardMarkup:
+    if require_sexuality:
+        return SEXUALITY_KEYBOARD
+    if is_admin(user_id):
+        return ADMIN_KEYBOARD
+    return USER_KEYBOARD
+
+
+async def safe_send(
+    application: Application,
+    user_id: int,
+    text: str,
+    *,
+    with_keyboard: bool = True,
+    require_sexuality: bool = False,
+) -> None:
     try:
-        keyboard = ADMIN_KEYBOARD if ADMIN_ID is not None and user_id == ADMIN_ID else USER_KEYBOARD
-        kwargs = {"reply_markup": keyboard} if with_keyboard else {}
+        kwargs = {}
+        if with_keyboard:
+            kwargs["reply_markup"] = keyboard_for_user(user_id, require_sexuality=require_sexuality)
         await application.bot.send_message(chat_id=user_id, text=text, **kwargs)
     except TelegramError:
         logging.warning("Failed to send message to %s", user_id)
@@ -186,12 +276,86 @@ async def notify_admin(application: Application, text: str) -> None:
     await safe_send(application, ADMIN_ID, text, with_keyboard=False)
 
 
+async def check_firewall_access(application: Application, user_id: int) -> bool:
+    if is_admin(user_id):
+        return True
+
+    if get_setting(SETTING_FIREWALL_ENABLED, "0") != "1":
+        return True
+
+    group_id = get_setting(SETTING_FIREWALL_GROUP, "").strip()
+    if not group_id:
+        await safe_send(application, user_id, "🧱 Firewall is enabled but group is not configured.")
+        return False
+
+    is_member = False
+    try:
+        member = await application.bot.get_chat_member(chat_id=group_id, user_id=user_id)
+        if member.status in {"creator", "administrator", "member", "restricted"}:
+            is_member = True
+    except TelegramError:
+        is_member = False
+
+    if is_member:
+        db_execute(
+            "UPDATE join_requests SET status = 'approved' WHERE user_id = ? AND group_id = ?",
+            (user_id, group_id),
+        )
+        return True
+
+    pending = db_execute(
+        """
+        SELECT 1 FROM join_requests
+        WHERE user_id = ? AND group_id = ? AND status = 'pending'
+        LIMIT 1
+        """,
+        (user_id, group_id),
+        fetchone=True,
+    )
+    if pending:
+        return True
+
+    firewall_msg = get_setting(SETTING_FIREWALL_MESSAGE, DEFAULT_FIREWALL_MESSAGE)
+    final_msg = firewall_msg.replace("{group}", group_id)
+    await safe_send(application, user_id, final_msg)
+    return False
+
+
+def admin_stats_text() -> str:
+    total = db_execute("SELECT COUNT(*) AS c FROM users", fetchone=True)["c"]
+    active = db_execute(
+        "SELECT COUNT(*) AS c FROM users WHERE status IN ('searching', 'chatting')",
+        fetchone=True,
+    )["c"]
+    inactive = total - active
+    male = db_execute(
+        "SELECT COUNT(*) AS c FROM users WHERE lower(COALESCE(sexuality, '')) = 'male'",
+        fetchone=True,
+    )["c"]
+    female = db_execute(
+        "SELECT COUNT(*) AS c FROM users WHERE lower(COALESCE(sexuality, '')) = 'female'",
+        fetchone=True,
+    )["c"]
+    fw_enabled = "ON" if get_setting(SETTING_FIREWALL_ENABLED, "0") == "1" else "OFF"
+    fw_group = get_setting(SETTING_FIREWALL_GROUP, "") or "Not set"
+
+    return (
+        "🛠️ Admin Dashboard\n"
+        f"👥 Total users: {total}\n"
+        f"🟢 Active users: {active}\n"
+        f"⚪ Inactive users: {inactive}\n"
+        f"♂️ Male users: {male}\n"
+        f"♀️ Female users: {female}\n"
+        f"🧱 Firewall: {fw_enabled}\n"
+        f"🎯 Firewall Group: {fw_group}"
+    )
+
+
 async def start_find_flow(application: Application, user_id: int) -> None:
     async with state_lock:
         user = ensure_user(user_id)
-
         if user["is_banned"] == 1 or user["status"] == "banned":
-            await safe_send(application, user_id, "You are banned from this bot.")
+            await safe_send(application, user_id, "⛔ You are banned from this bot.")
             return
 
         if user["status"] == "chatting" and user["partner_id"] is not None:
@@ -202,27 +366,41 @@ async def start_find_flow(application: Application, user_id: int) -> None:
 
         partner_id = pop_valid_partner(user_id)
         if partner_id is None:
-            await safe_send(application, user_id, "Searching for a stranger...")
+            await safe_send(application, user_id, "🔎 Searching for a stranger...")
             return
 
         update_user(user_id, status="chatting", partner_id=partner_id, waiting_since=None)
         update_user(partner_id, status="chatting", partner_id=user_id, waiting_since=None)
 
-    await safe_send(application, user_id, "Connected with a stranger. Say hi!")
-    await safe_send(application, partner_id, "Connected with a stranger. Say hi!")
+    await safe_send(application, user_id, "✅ Connected with a stranger. Say hi!")
+    await safe_send(application, partner_id, "✅ Connected with a stranger. Say hi!")
 
 
 async def start_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     user_id = update.effective_user.id
-    ensure_user(user_id)
-    if ADMIN_ID is not None and user_id == ADMIN_ID:
+    user = ensure_user(user_id)
+
+    if not await check_firewall_access(context.application, user_id):
+        return
+
+    if is_admin(user_id):
         await safe_send(
             context.application,
             user_id,
-            "✅ Admin access granted\nUse 📊 Admin Dashboard to view live bot stats.",
+            "✅ Admin access granted\nTap 🛠️ Admin Panel to open dashboard.",
         )
         return
-    await safe_send(context.application, user_id, "👋 Welcome. Use /find to chat anonymously.")
+
+    if not user["sexuality"]:
+        await safe_send(
+            context.application,
+            user_id,
+            "Please select your sexuality to continue:",
+            require_sexuality=True,
+        )
+        return
+
+    await safe_send(context.application, user_id, get_setting(SETTING_START_MESSAGE, DEFAULT_START_MESSAGE))
 
 
 async def find_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -231,13 +409,22 @@ async def find_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if blocked:
         await safe_send(context.application, user_id, f"Please wait {wait_left:.1f}s before /find again.")
         return
+
+    user = ensure_user(user_id)
+    if not await check_firewall_access(context.application, user_id):
+        return
+    if not user["sexuality"]:
+        await safe_send(context.application, user_id, "Please select sexuality first:", require_sexuality=True)
+        return
     await start_find_flow(context.application, user_id)
 
 
 async def stop_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     user_id = update.effective_user.id
-    partner_id = None
+    if not await check_firewall_access(context.application, user_id):
+        return
 
+    partner_id = None
     async with state_lock:
         user = ensure_user(user_id)
         partner_id = user["partner_id"]
@@ -248,7 +435,7 @@ async def stop_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
             if partner and partner["partner_id"] == user_id:
                 update_user(partner_id, status="idle", partner_id=None, waiting_since=None)
 
-    await safe_send(context.application, user_id, "Chat stopped. Use /find to search again.")
+    await safe_send(context.application, user_id, "🛑 Chat stopped. Use /find to search again.")
     if partner_id is not None:
         await safe_send(context.application, partner_id, "Stranger left the chat.")
 
@@ -259,6 +446,13 @@ async def next_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if blocked:
         await safe_send(context.application, user_id, f"Please wait {wait_left:.1f}s before /next again.")
         return
+    if not await check_firewall_access(context.application, user_id):
+        return
+
+    user = ensure_user(user_id)
+    if not user["sexuality"]:
+        await safe_send(context.application, user_id, "Please select sexuality first:", require_sexuality=True)
+        return
 
     previous_partner_id = None
     new_partner_id = None
@@ -266,7 +460,6 @@ async def next_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     async with state_lock:
         user = ensure_user(user_id)
         previous_partner_id = user["partner_id"]
-
         if previous_partner_id is not None:
             partner = get_user(previous_partner_id)
             if partner and partner["partner_id"] == user_id:
@@ -279,14 +472,14 @@ async def next_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
             update_user(new_partner_id, status="chatting", partner_id=user_id, waiting_since=None)
 
     if previous_partner_id is not None:
-        await safe_send(context.application, previous_partner_id, "Stranger skipped the chat.")
+        await safe_send(context.application, previous_partner_id, "⏭️ Stranger skipped the chat.")
 
     if new_partner_id is None:
-        await safe_send(context.application, user_id, "Searching for a new stranger...")
+        await safe_send(context.application, user_id, "🔎 Searching for a new stranger...")
         return
 
-    await safe_send(context.application, user_id, "Connected with a new stranger.")
-    await safe_send(context.application, new_partner_id, "Connected with a stranger. Say hi!")
+    await safe_send(context.application, user_id, "✅ Connected with a new stranger.")
+    await safe_send(context.application, new_partner_id, "✅ Connected with a stranger. Say hi!")
 
 
 async def report_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -294,6 +487,8 @@ async def report_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
     blocked, wait_left = on_cooldown(user_id, "report")
     if blocked:
         await safe_send(context.application, user_id, f"Please wait {wait_left:.1f}s before /report again.")
+        return
+    if not await check_firewall_access(context.application, user_id):
         return
 
     partner_id = None
@@ -309,7 +504,7 @@ async def report_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
 
         partner = get_user(partner_id)
         if not partner:
-            update_user(user_id, status="idle", partner_id=None)
+            update_user(user_id, status="idle", partner_id=None, waiting_since=None)
             await safe_send(context.application, user_id, "No active partner to report.")
             return
 
@@ -339,16 +534,8 @@ async def report_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
         update_user(user_id, status="idle", partner_id=None, waiting_since=None)
 
     if banned_now:
-        await safe_send(
-            context.application,
-            user_id,
-            f"Report submitted. User banned at {reports_received} reports.",
-        )
-        await safe_send(
-            context.application,
-            partner_id,
-            "You have been banned due to repeated reports.",
-        )
+        await safe_send(context.application, user_id, f"Report submitted. User banned at {reports_received} reports.")
+        await safe_send(context.application, partner_id, "You have been banned due to repeated reports.")
         await notify_admin(
             context.application,
             f"User {partner_id} was banned by reports ({reports_received}). Reporter: {user_id}",
@@ -364,29 +551,75 @@ async def report_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
 
 async def admin_stats_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     user_id = update.effective_user.id
-    if ADMIN_ID is None or user_id != ADMIN_ID:
+    if not is_admin(user_id):
         await safe_send(context.application, user_id, "Unauthorized.")
         return
+    await safe_send(context.application, user_id, admin_stats_text())
 
-    chatting = db_execute("SELECT COUNT(*) AS c FROM users WHERE status = 'chatting'", fetchone=True)["c"]
-    searching = db_execute("SELECT COUNT(*) AS c FROM users WHERE status = 'searching'", fetchone=True)["c"]
-    banned = db_execute("SELECT COUNT(*) AS c FROM users WHERE is_banned = 1", fetchone=True)["c"]
-    total = db_execute("SELECT COUNT(*) AS c FROM users", fetchone=True)["c"]
 
-    await safe_send(
-        context.application,
-        user_id,
-        (
-            "📊 Admin Dashboard\n"
-            f"👥 Total users: {total}\n"
-            f"💬 Chatting users: {chatting}\n"
-            f"🔎 Searching users: {searching}\n"
-            f"⛔ Banned users: {banned}"
-        ),
+async def chat_join_request(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not update.chat_join_request:
+        return
+    request = update.chat_join_request
+    db_execute(
+        """
+        INSERT INTO join_requests (user_id, group_id, requested_at, status)
+        VALUES (?, ?, ?, 'pending')
+        ON CONFLICT(user_id, group_id)
+        DO UPDATE SET requested_at = excluded.requested_at, status = 'pending'
+        """,
+        (request.from_user.id, str(request.chat.id), int(time.time())),
     )
 
 
+async def handle_admin_pending_text(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+    text: str,
+) -> bool:
+    global admin_pending_action
+    user_id = update.effective_user.id
+    if not is_admin(user_id) or not admin_pending_action:
+        return False
+
+    if text == BTN_ADMIN_CANCEL:
+        admin_pending_action = None
+        await safe_send(context.application, user_id, "Admin edit cancelled.")
+        return True
+
+    if text in {
+        BTN_ADMIN_PANEL,
+        BTN_SET_START,
+        BTN_TOGGLE_FIREWALL,
+        BTN_SET_GROUP,
+        BTN_SET_FW_MSG,
+    }:
+        return False
+
+    if admin_pending_action == "set_start_message":
+        set_setting(SETTING_START_MESSAGE, text)
+        admin_pending_action = None
+        await safe_send(context.application, user_id, "✅ Start message updated.")
+        return True
+
+    if admin_pending_action == "set_firewall_group":
+        set_setting(SETTING_FIREWALL_GROUP, text.strip())
+        admin_pending_action = None
+        await safe_send(context.application, user_id, f"✅ Firewall group updated to: {text.strip()}")
+        return True
+
+    if admin_pending_action == "set_firewall_message":
+        set_setting(SETTING_FIREWALL_MESSAGE, text)
+        admin_pending_action = None
+        await safe_send(context.application, user_id, "✅ Firewall message updated.")
+        return True
+
+    return False
+
+
 async def text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    global admin_pending_action
+
     if not update.message:
         return
 
@@ -395,20 +628,70 @@ async def text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     if not text:
         return
 
-    if text == "🔎 Find Stranger" or text == "Find Stranger":
-        await start_find_flow(context.application, user_id)
+    ensure_user(user_id)
+
+    if await handle_admin_pending_text(update, context, text):
         return
-    if text == "⏭️ Next" or text == "Next":
+
+    if text in {BTN_SEX_MALE, BTN_SEX_FEMALE}:
+        sexuality_value = "male" if text == BTN_SEX_MALE else "female"
+        update_user(user_id, sexuality=sexuality_value)
+        await safe_send(context.application, user_id, f"✅ Saved sexuality: {sexuality_value.title()}")
+        return
+
+    if is_admin(user_id):
+        if text == BTN_ADMIN_PANEL:
+            await safe_send(context.application, user_id, admin_stats_text())
+            return
+        if text == BTN_SET_START:
+            admin_pending_action = "set_start_message"
+            await safe_send(context.application, user_id, "Send new start message text now:")
+            return
+        if text == BTN_TOGGLE_FIREWALL:
+            enabled = get_setting(SETTING_FIREWALL_ENABLED, "0") == "1"
+            set_setting(SETTING_FIREWALL_ENABLED, "0" if enabled else "1")
+            await safe_send(context.application, user_id, f"✅ Firewall is now {'OFF' if enabled else 'ON'}.")
+            return
+        if text == BTN_SET_GROUP:
+            admin_pending_action = "set_firewall_group"
+            await safe_send(
+                context.application,
+                user_id,
+                "Send firewall group ID or username now (example: -1001234567890 or @mygroup).",
+            )
+            return
+        if text == BTN_SET_FW_MSG:
+            admin_pending_action = "set_firewall_message"
+            await safe_send(
+                context.application,
+                user_id,
+                "Send new firewall message now. Use {group} where group should appear.",
+            )
+            return
+        if text == BTN_ADMIN_CANCEL:
+            admin_pending_action = None
+            await safe_send(context.application, user_id, "No pending admin edit.")
+            return
+
+    if text == BTN_FIND or text == "Find Stranger":
+        await find_cmd(update, context)
+        return
+    if text == BTN_NEXT or text == "Next":
         await next_cmd(update, context)
         return
-    if text == "🛑 Stop" or text == "Stop":
+    if text == BTN_STOP or text == "Stop":
         await stop_cmd(update, context)
         return
-    if text == "🚩 Report" or text == "Report":
+    if text == BTN_REPORT or text == "Report":
         await report_cmd(update, context)
         return
-    if text == ADMIN_DASHBOARD_BUTTON:
-        await admin_stats_cmd(update, context)
+
+    if not await check_firewall_access(context.application, user_id):
+        return
+
+    user = ensure_user(user_id)
+    if not user["sexuality"]:
+        await safe_send(context.application, user_id, "Please select sexuality first:", require_sexuality=True)
         return
 
     partner_id = None
@@ -419,7 +702,7 @@ async def text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     async with state_lock:
         user = ensure_user(user_id)
         if user["is_banned"] == 1 or user["status"] == "banned":
-            await safe_send(context.application, user_id, "You are banned from this bot.")
+            await safe_send(context.application, user_id, "⛔ You are banned from this bot.")
             return
 
         if user["status"] != "chatting" or user["partner_id"] is None:
@@ -453,11 +736,7 @@ async def text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
                 update_user(user_id, warnings=warnings)
 
     if moderation_block and not banned_now:
-        await safe_send(
-            context.application,
-            user_id,
-            f"Message blocked by moderation. Warnings left: {warnings_left}.",
-        )
+        await safe_send(context.application, user_id, f"Message blocked by moderation. Warnings left: {warnings_left}.")
         return
 
     if banned_now:
@@ -481,12 +760,22 @@ async def media_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
         return
 
     user_id = update.effective_user.id
+    ensure_user(user_id)
+
+    if not await check_firewall_access(context.application, user_id):
+        return
+
+    user = ensure_user(user_id)
+    if not user["sexuality"]:
+        await safe_send(context.application, user_id, "Please select sexuality first:", require_sexuality=True)
+        return
+
     partner_id = None
 
     async with state_lock:
         user = ensure_user(user_id)
         if user["is_banned"] == 1 or user["status"] == "banned":
-            await safe_send(context.application, user_id, "You are banned from this bot.")
+            await safe_send(context.application, user_id, "⛔ You are banned from this bot.")
             return
 
         if user["status"] != "chatting" or user["partner_id"] is None:
@@ -524,6 +813,7 @@ def build_app() -> Application:
     app.add_handler(CommandHandler("next", next_cmd))
     app.add_handler(CommandHandler("report", report_cmd))
     app.add_handler(CommandHandler("admin_stats", admin_stats_cmd))
+    app.add_handler(ChatJoinRequestHandler(chat_join_request))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, text_handler))
     app.add_handler(MessageHandler(filters.ALL & ~filters.TEXT & ~filters.COMMAND, media_handler))
 
@@ -545,3 +835,4 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
+

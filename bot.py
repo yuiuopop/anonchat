@@ -51,9 +51,9 @@ USER_KEYBOARD = ReplyKeyboardMarkup([[BTN_FIND, BTN_NEXT], [BTN_STOP, BTN_REPORT
 SEXUALITY_KEYBOARD = ReplyKeyboardMarkup([[BTN_SEX_MALE, BTN_SEX_FEMALE]], resize_keyboard=True)
 ADMIN_KEYBOARD = ReplyKeyboardMarkup(
     [
-        [BTN_ADMIN_PANEL],
         [BTN_FIND, BTN_NEXT],
         [BTN_STOP, BTN_REPORT],
+        [BTN_ADMIN_PANEL],
     ],
     resize_keyboard=True,
 )

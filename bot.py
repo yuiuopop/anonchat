@@ -8,7 +8,7 @@ import time
 from threading import Lock
 from typing import Optional
 
-from telegram import ReplyKeyboardMarkup, Update
+from telegram import InlineKeyboardButton, InlineKeyboardMarkup, ReplyKeyboardMarkup, Update
 from telegram.constants import ChatAction
 from telegram.error import TelegramError
 from telegram.ext import (
@@ -63,6 +63,7 @@ ADMIN_KEYBOARD = ReplyKeyboardMarkup(
 SETTING_START_MESSAGE = "start_message"
 SETTING_FIREWALL_ENABLED = "firewall_enabled"
 SETTING_FIREWALL_GROUP = "firewall_group"
+SETTING_FIREWALL_GROUP_LINK = "firewall_group_link"
 SETTING_FIREWALL_MESSAGE = "firewall_message"
 
 DEFAULT_START_MESSAGE = "👋 Welcome to Anonymous Chat Bot.\nUse /find to connect with a stranger."
@@ -161,6 +162,7 @@ def init_db() -> None:
     set_setting_if_missing(SETTING_START_MESSAGE, DEFAULT_START_MESSAGE)
     set_setting_if_missing(SETTING_FIREWALL_ENABLED, "0")
     set_setting_if_missing(SETTING_FIREWALL_GROUP, "")
+    set_setting_if_missing(SETTING_FIREWALL_GROUP_LINK, "")
     set_setting_if_missing(SETTING_FIREWALL_MESSAGE, DEFAULT_FIREWALL_MESSAGE)
 
 
@@ -260,11 +262,14 @@ async def safe_send(
     *,
     with_keyboard: bool = True,
     require_sexuality: bool = False,
+    inline_markup: Optional[InlineKeyboardMarkup] = None,
 ) -> None:
     try:
         kwargs = {}
         if with_keyboard:
             kwargs["reply_markup"] = keyboard_for_user(user_id, require_sexuality=require_sexuality)
+        if inline_markup is not None:
+            kwargs["reply_markup"] = inline_markup
         await application.bot.send_message(chat_id=user_id, text=text, **kwargs)
     except TelegramError:
         logging.warning("Failed to send message to %s", user_id)
@@ -317,7 +322,19 @@ async def check_firewall_access(application: Application, user_id: int) -> bool:
 
     firewall_msg = get_setting(SETTING_FIREWALL_MESSAGE, DEFAULT_FIREWALL_MESSAGE)
     final_msg = firewall_msg.replace("{group}", group_id)
-    await safe_send(application, user_id, final_msg)
+    group_link = get_setting(SETTING_FIREWALL_GROUP_LINK, "").strip()
+    if group_link:
+        await safe_send(
+            application,
+            user_id,
+            final_msg,
+            inline_markup=InlineKeyboardMarkup(
+                [[InlineKeyboardButton("🔗 Join Firewall Group", url=group_link)]]
+            ),
+            with_keyboard=False,
+        )
+    else:
+        await safe_send(application, user_id, final_msg)
     return False
 
 
@@ -338,6 +355,7 @@ def admin_stats_text() -> str:
     )["c"]
     fw_enabled = "ON" if get_setting(SETTING_FIREWALL_ENABLED, "0") == "1" else "OFF"
     fw_group = get_setting(SETTING_FIREWALL_GROUP, "") or "Not set"
+    fw_group_link = get_setting(SETTING_FIREWALL_GROUP_LINK, "") or "Not set"
 
     return (
         "🛠️ Admin Dashboard\n"
@@ -347,7 +365,8 @@ def admin_stats_text() -> str:
         f"♂️ Male users: {male}\n"
         f"♀️ Female users: {female}\n"
         f"🧱 Firewall: {fw_enabled}\n"
-        f"🎯 Firewall Group: {fw_group}"
+        f"🎯 Firewall Group: {fw_group}\n"
+        f"🔗 Firewall Link: {fw_group_link}"
     )
 
 
@@ -603,9 +622,35 @@ async def handle_admin_pending_text(
         return True
 
     if admin_pending_action == "set_firewall_group":
-        set_setting(SETTING_FIREWALL_GROUP, text.strip())
+        raw = text.strip()
+        group_for_check = raw
+        group_link = ""
+
+        if raw.startswith("https://t.me/") or raw.startswith("http://t.me/"):
+            username = raw.split("t.me/", 1)[1].strip().strip("/")
+            if username:
+                group_for_check = f"@{username}"
+                group_link = f"https://t.me/{username}"
+        elif raw.startswith("t.me/"):
+            username = raw.split("t.me/", 1)[1].strip().strip("/")
+            if username:
+                group_for_check = f"@{username}"
+                group_link = f"https://t.me/{username}"
+        elif raw.startswith("@"):
+            username = raw[1:].strip()
+            if username:
+                group_for_check = f"@{username}"
+                group_link = f"https://t.me/{username}"
+
+        set_setting(SETTING_FIREWALL_GROUP, group_for_check)
+        set_setting(SETTING_FIREWALL_GROUP_LINK, group_link)
         admin_pending_action = None
-        await safe_send(context.application, user_id, f"✅ Firewall group updated to: {text.strip()}")
+        link_text = group_link if group_link else "Not available (set @username or t.me link for button)"
+        await safe_send(
+            context.application,
+            user_id,
+            f"✅ Firewall group updated to: {group_for_check}\n🔗 Button link: {link_text}",
+        )
         return True
 
     if admin_pending_action == "set_firewall_message":
@@ -641,6 +686,11 @@ async def text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
 
     if is_admin(user_id):
         if text == BTN_ADMIN_PANEL:
+            await safe_send(
+                context.application,
+                user_id,
+                "✅ Admin access granted\nOpening admin dashboard...",
+            )
             await safe_send(context.application, user_id, admin_stats_text())
             return
         if text == BTN_SET_START:
@@ -835,4 +885,3 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-

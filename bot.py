@@ -13,6 +13,7 @@ from telegram.constants import ChatAction
 from telegram.error import TelegramError
 from telegram.ext import (
     Application,
+    CallbackQueryHandler,
     ChatJoinRequestHandler,
     CommandHandler,
     ContextTypes,
@@ -51,11 +52,8 @@ SEXUALITY_KEYBOARD = ReplyKeyboardMarkup([[BTN_SEX_MALE, BTN_SEX_FEMALE]], resiz
 ADMIN_KEYBOARD = ReplyKeyboardMarkup(
     [
         [BTN_ADMIN_PANEL],
-        [BTN_SET_START, BTN_TOGGLE_FIREWALL],
-        [BTN_SET_GROUP_LINK, BTN_SET_FW_MSG],
         [BTN_FIND, BTN_NEXT],
         [BTN_STOP, BTN_REPORT],
-        [BTN_ADMIN_CANCEL],
     ],
     resize_keyboard=True,
 )
@@ -68,6 +66,13 @@ SETTING_FIREWALL_MESSAGE = "firewall_message"
 
 DEFAULT_START_MESSAGE = "👋 Welcome to Anonymous Chat Bot.\nUse /find to connect with a stranger."
 DEFAULT_FIREWALL_MESSAGE = "🧱 Access locked. Join {group} and try again."
+
+CB_ADMIN_STATS = "admin:stats"
+CB_ADMIN_SET_START = "admin:set_start"
+CB_ADMIN_TOGGLE_FW = "admin:toggle_fw"
+CB_ADMIN_SET_LINK = "admin:set_link"
+CB_ADMIN_SET_FW_MSG = "admin:set_fw_msg"
+CB_ADMIN_CANCEL = "admin:cancel"
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(levelname)s | %(message)s")
 
@@ -255,6 +260,23 @@ def keyboard_for_user(user_id: int, require_sexuality: bool = False) -> ReplyKey
     return USER_KEYBOARD
 
 
+def admin_panel_markup() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        [
+            [InlineKeyboardButton("📊 Refresh Stats", callback_data=CB_ADMIN_STATS)],
+            [
+                InlineKeyboardButton(BTN_SET_START, callback_data=CB_ADMIN_SET_START),
+                InlineKeyboardButton(BTN_TOGGLE_FIREWALL, callback_data=CB_ADMIN_TOGGLE_FW),
+            ],
+            [
+                InlineKeyboardButton(BTN_SET_GROUP_LINK, callback_data=CB_ADMIN_SET_LINK),
+                InlineKeyboardButton(BTN_SET_FW_MSG, callback_data=CB_ADMIN_SET_FW_MSG),
+            ],
+            [InlineKeyboardButton(BTN_ADMIN_CANCEL, callback_data=CB_ADMIN_CANCEL)],
+        ]
+    )
+
+
 async def safe_send(
     application: Application,
     user_id: int,
@@ -367,6 +389,17 @@ def admin_stats_text() -> str:
         f"🧱 Firewall: {fw_enabled}\n"
         f"🎯 Firewall Group: {fw_group}\n"
         f"🔗 Firewall Link: {fw_group_link}"
+    )
+
+
+async def send_admin_panel(application: Application, user_id: int, heading: Optional[str] = None) -> None:
+    text = admin_stats_text() if not heading else f"{heading}\n\n{admin_stats_text()}"
+    await safe_send(
+        application,
+        user_id,
+        text,
+        with_keyboard=False,
+        inline_markup=admin_panel_markup(),
     )
 
 
@@ -573,7 +606,7 @@ async def admin_stats_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     if not is_admin(user_id):
         await safe_send(context.application, user_id, "Unauthorized.")
         return
-    await safe_send(context.application, user_id, admin_stats_text())
+    await send_admin_panel(context.application, user_id)
 
 
 async def chat_join_request(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -662,6 +695,62 @@ async def handle_admin_pending_text(
     return False
 
 
+async def admin_callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    global admin_pending_action
+
+    query = update.callback_query
+    if not query:
+        return
+    await query.answer()
+
+    user_id = query.from_user.id
+    if not is_admin(user_id):
+        return
+
+    data = query.data or ""
+
+    if data == CB_ADMIN_STATS:
+        await query.edit_message_text(admin_stats_text(), reply_markup=admin_panel_markup())
+        return
+
+    if data == CB_ADMIN_SET_START:
+        admin_pending_action = "set_start_message"
+        await safe_send(context.application, user_id, "Send new start message text now:")
+        return
+
+    if data == CB_ADMIN_TOGGLE_FW:
+        enabled = get_setting(SETTING_FIREWALL_ENABLED, "0") == "1"
+        set_setting(SETTING_FIREWALL_ENABLED, "0" if enabled else "1")
+        await query.edit_message_text(
+            f"✅ Firewall is now {'OFF' if enabled else 'ON'}.\n\n{admin_stats_text()}",
+            reply_markup=admin_panel_markup(),
+        )
+        return
+
+    if data == CB_ADMIN_SET_LINK:
+        admin_pending_action = "set_firewall_group"
+        await safe_send(
+            context.application,
+            user_id,
+            "Send firewall group link now (example: https://t.me/yourgroup or t.me/yourgroup).",
+        )
+        return
+
+    if data == CB_ADMIN_SET_FW_MSG:
+        admin_pending_action = "set_firewall_message"
+        await safe_send(
+            context.application,
+            user_id,
+            "Send new firewall message now. Use {group} where group should appear.",
+        )
+        return
+
+    if data == CB_ADMIN_CANCEL:
+        admin_pending_action = None
+        await safe_send(context.application, user_id, "Admin edit cancelled.")
+        return
+
+
 async def text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     global admin_pending_action
 
@@ -686,41 +775,11 @@ async def text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
 
     if is_admin(user_id):
         if text == BTN_ADMIN_PANEL:
-            await safe_send(
+            await send_admin_panel(
                 context.application,
                 user_id,
-                "✅ Admin access granted\nOpening admin dashboard...",
+                heading="✅ Admin access granted\nOpening admin dashboard...",
             )
-            await safe_send(context.application, user_id, admin_stats_text())
-            return
-        if text == BTN_SET_START:
-            admin_pending_action = "set_start_message"
-            await safe_send(context.application, user_id, "Send new start message text now:")
-            return
-        if text == BTN_TOGGLE_FIREWALL:
-            enabled = get_setting(SETTING_FIREWALL_ENABLED, "0") == "1"
-            set_setting(SETTING_FIREWALL_ENABLED, "0" if enabled else "1")
-            await safe_send(context.application, user_id, f"✅ Firewall is now {'OFF' if enabled else 'ON'}.")
-            return
-        if text == BTN_SET_GROUP_LINK:
-            admin_pending_action = "set_firewall_group"
-            await safe_send(
-                context.application,
-                user_id,
-                "Send firewall group link now (example: https://t.me/yourgroup or t.me/yourgroup).",
-            )
-            return
-        if text == BTN_SET_FW_MSG:
-            admin_pending_action = "set_firewall_message"
-            await safe_send(
-                context.application,
-                user_id,
-                "Send new firewall message now. Use {group} where group should appear.",
-            )
-            return
-        if text == BTN_ADMIN_CANCEL:
-            admin_pending_action = None
-            await safe_send(context.application, user_id, "No pending admin edit.")
             return
 
     if text == BTN_FIND or text == "Find Stranger":
@@ -863,6 +922,7 @@ def build_app() -> Application:
     app.add_handler(CommandHandler("next", next_cmd))
     app.add_handler(CommandHandler("report", report_cmd))
     app.add_handler(CommandHandler("admin_stats", admin_stats_cmd))
+    app.add_handler(CallbackQueryHandler(admin_callback_handler, pattern=r"^admin:"))
     app.add_handler(ChatJoinRequestHandler(chat_join_request))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, text_handler))
     app.add_handler(MessageHandler(filters.ALL & ~filters.TEXT & ~filters.COMMAND, media_handler))
